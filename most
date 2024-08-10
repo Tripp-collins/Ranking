@@ -1,0 +1,136 @@
+# Function to log into Roblox
+def login_to_roblox():
+    global roblox_api
+    roblox_api = RobloxApi(cookie=ROBLOX_COOKIE)
+    roblox_api.check_authentication()
+    print(f"Logged in as: {roblox_api.get_authenticated_user()}")
+
+# Function to reauthenticate if necessary
+def reauthenticate():
+    try:
+        print("Attempting reauthentication...")
+        login_to_roblox()
+        print("Reauthentication successful.")
+    except Exception as e:
+        print(f"Reauthentication failed: {e}")
+
+# Discord bot setup
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.guilds = True
+
+bot = commands.AutoShardedBot(command_prefix='/', intents=intents)
+
+# Set up statuses
+statuses = [
+    {"type": discord.ActivityType.playing, "name": "Roblox"},
+    {"type": discord.ActivityType.streaming, "name": "Ranking", "url": "https://www.twitch.tv/somechannel"},
+    {"type": discord.ActivityType.listening, "name": "for commands"},
+    {"type": discord.ActivityType.watching, "name": "over the server"},
+    {"type": discord.ActivityType.competing, "name": "Free ranking vs 10$ service LOL"}
+]
+
+@tasks.loop(minutes=10)
+async def change_status():
+    current_status = statuses[change_status.current_loop % len(statuses)]
+    activity = discord.Activity(type=current_status["type"], name=current_status["name"])
+    if "url" in current_status:
+        activity.url = current_status["url"]
+    await bot.change_presence(activity=activity)
+
+@bot.tree.command(name='rank', description='Rank a user in a Roblox group')
+async def rank(interaction: discord.Interaction, username: str, role_name: str):
+    if str(interaction.guild.id) not in RANKING_GUILD:
+        await interaction.response.send_message("This server is not allowed to use /rank.", ephemeral=True)
+        return
+    if not any(role.name in ROLES_ALLOWED for role in interaction.user.roles):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        user_id = roblox_api.get_user_id_by_username(username)
+        if not user_id:
+            await interaction.followup.send("User not found.", ephemeral=True)
+            log_to_webhook(f"User not found for username: {username} (requested by {interaction.user}).")
+            return
+
+        role_id = roblox_api.get_role_id_by_name(GROUP_ID, role_name)
+        if not role_id:
+            await interaction.followup.send("Role not found.", ephemeral=True)
+            log_to_webhook(f"Role not found for name: {role_name} (requested by {interaction.user}).")
+            return
+
+        # Check if the user is already at the specified rank
+        current_role_id = roblox_api.get_user_rank_in_group(GROUP_ID, user_id)
+        if current_role_id == role_id:
+            await interaction.followup.send(f"User {username} is already at the rank {role_name}.", ephemeral=True)
+            log_to_webhook(f"Attempted to rank {username} to {role_name}, but user is already at this rank.")
+            return
+
+        # Attempt to rank the user
+        result = roblox_api.rank_user(GROUP_ID, user_id, role_id)
+        if result:
+            await interaction.followup.send(f'User {username} has been ranked to {role_name}.')
+            log_to_webhook(f"{interaction.user} successfully ranked user {username} to {role_name}.")
+        else:
+            await interaction.followup.send('Failed to rank user. Please ensure the bot account has the necessary permissions and try again.', ephemeral=True)
+            log_to_webhook(f"{interaction.user} failed to rank user {username} to {role_name}.")
+    except Exception as e:
+        if '403 Forbidden' in str(e):
+            reauthenticate()
+            # Optionally retry the ranking process after reauthenticating
+            try:
+                result = roblox_api.rank_user(GROUP_ID, user_id, role_id)
+                if result:
+                    await interaction.followup.send(f'User {username} has been ranked to {role_name} after reauthentication.')
+                    log_to_webhook(f"{interaction.user} successfully ranked user {username} to {role_name} after reauthentication.")
+                else:
+                    await interaction.followup.send('Failed to rank user after reauthentication.', ephemeral=True)
+                    log_to_webhook(f"{interaction.user} failed to rank user {username} to {role_name} after reauthentication.")
+            except Exception as retry_error:
+                await interaction.followup.send('An error occurred while ranking the user after reauthentication.', ephemeral=True)
+                log_to_webhook(f"Error ranking user {username} to {role_name} by {interaction.user} after reauthentication: {retry_error}")
+        else:
+            await interaction.followup.send('An error occurred while ranking the user.', ephemeral=True)
+            log_to_webhook(f"Error ranking user {username} to {role_name} by {interaction.user}: {e}")
+            
+@bot.tree.command(name='membercount', description='Displays the total number of members, humans, and bots')
+async def membercount(interaction: discord.Interaction):
+    guild = interaction.guild
+
+    total_members = guild.member_count
+    human_count = sum(1 for member in guild.members if not member.bot)
+    bot_count = sum(1 for member in guild.members if member.bot)
+
+    await interaction.response.send_message(
+        f"Total Members: {total_members}\nHumans: {human_count}\nBots: {bot_count}"
+    )
+    log_to_webhook(f"Member count requested by {interaction.user}: Total: {total_members}, Humans: {human_count}, Bots: {bot_count}")
+
+@bot.tree.command(name='yo', description='p')
+async def yo(interaction: discord.Interaction):
+    await interaction.response.send_message("stop being retarded")
+
+@bot.tree.command(name='say', description='make the bot say something')
+async def say(interaction: discord.Interaction, message: str):
+    if any(blacklisted_word in message.lower() for blacklisted_word in blacklisted_words):
+        await interaction.response.send_message("Your message contains inappropriate content and cannot be repeated.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(message)
+
+@bot.event
+async def on_ready():
+    print(f'wsp my name is {bot.user.name}')
+    login_to_roblox()
+    change_status.start()
+    try:
+        await bot.tree.sync()
+        print('i synced the goofy commands ya')
+    except Exception as e:
+        print(f'commands did not sync wtff heres da error: {e}')
+
+bot.run(TOKEN)
